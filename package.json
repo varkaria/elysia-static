@@ -1,5 +1,5 @@
 {
-    "name": "@elysiajs/static",
+    "name": "@varkaria/elysia-static",
     "version": "1.4.4",
     "license": "MIT",
     "scripts": {
@@ -57,9 +57,9 @@
     },
     "repository": {
         "type": "git",
-        "url": "https://github.com/elysiajs/elysia-static"
+        "url": "https://github.com/varkaria/elysia-static"
     },
-    "bugs": "https://github.com/elysiajs/elysia-static/issues",
+    "bugs": "https://github.com/varkaria/elysia-static/issues",
     "description": "Plugin for Elysia for serving static folder",
-    "homepage": "https://github.com/elysiajs/elysia-static"
+    "homepage": "https://github.com/varkaria/elysia-static"
 }
