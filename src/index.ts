@@ -14,9 +14,14 @@ import {
     getFile,
     isBun,
     listHTMLFiles,
-    isNotEmpty
+    isNotEmpty,
+    parseRange,
+    getFileRange,
+    formatContentRange
 } from './utils'
 import type { StaticOptions } from './types'
+
+
 
 export async function staticPlugin<const Prefix extends string = '/prefix'>({
     assets = 'public',
@@ -57,11 +62,11 @@ export async function staticPlugin<const Prefix extends string = '/prefix'>({
     const shouldIgnore = !ignorePatterns.length
         ? () => false
         : (file: string) =>
-              ignorePatterns.find((pattern) =>
-                  typeof pattern === 'string'
-                      ? pattern.includes(file)
-                      : pattern.test(file)
-              )
+            ignorePatterns.find((pattern) =>
+                typeof pattern === 'string'
+                    ? pattern.includes(file)
+                    : pattern.test(file)
+            )
 
     const app = new Elysia({
         name: 'static',
@@ -112,11 +117,62 @@ export async function staticPlugin<const Prefix extends string = '/prefix'>({
 
                 const etag = await generateETag(file)
 
-                function handleCache({
+                // Get file size for range requests
+                const fileSize = isBun
+                    ? (file as any).size
+                    : (file as Buffer).length
+
+                async function handleRangeRequest(
+                    requestHeaders: Record<string, string>,
+                    fileData: typeof file,
+                    fileSize: number
+                ): Promise<Response | null> {
+                    const rangeHeader = requestHeaders['range']
+                    if (!rangeHeader) return null
+
+                    const range = parseRange(rangeHeader, fileSize)
+                    if (!range) return null
+
+                    let rangeData: Buffer | ArrayBuffer
+                    if (isBun) {
+                        const arrayBuffer = await (fileData as any).arrayBuffer()
+                        rangeData = arrayBuffer.slice(range.start, range.end + 1)
+                    } else {
+                        const buffer = fileData as Buffer
+                        rangeData = buffer.subarray(range.start, range.end + 1)
+                    }
+
+                    const headers = Object.assign(
+                        {
+                            'Content-Range': formatContentRange(range, fileSize),
+                            'Cache-Control': maxAge
+                                ? `${directive}, max-age=${maxAge}`
+                                : directive,
+                            'Accept-Ranges': 'bytes'
+                        },
+                        initialHeaders,
+                        etag ? { Etag: etag } : {}
+                    )
+
+                    return new Response(rangeData, {
+                        status: 206,
+                        headers
+                    })
+                }
+
+                async function handleCache({
                     headers: requestHeaders
                 }: {
                     headers: Record<string, string>
                 }) {
+                    // Check for range request first
+                    const rangeResponse = await handleRangeRequest(
+                        requestHeaders,
+                        file,
+                        fileSize
+                    )
+                    if (rangeResponse) return rangeResponse
+
                     if (etag) {
                         let cached = isCached(
                             requestHeaders as any,
@@ -135,7 +191,7 @@ export async function staticPlugin<const Prefix extends string = '/prefix'>({
                             const cache = fileCache.get(pathName)
                             if (cache) return cache.clone()
 
-                            return cached.then((cached) => {
+                            return cached.then(async (cached) => {
                                 if (cached)
                                     return new Response(null, {
                                         status: 304,
@@ -149,13 +205,14 @@ export async function staticPlugin<const Prefix extends string = '/prefix'>({
                                         {
                                             'Cache-Control': maxAge
                                                 ? `${directive}, max-age=${maxAge}`
-                                                : directive
+                                                : directive,
+                                            'Accept-Ranges': 'bytes'
                                         },
                                         initialHeaders,
                                         etag ? { Etag: etag } : {}
                                     )
                                 })
-                                fileCache.set(prefix, response)
+                                fileCache.set(pathName, response)
 
                                 return response.clone()
                             })
@@ -170,7 +227,8 @@ export async function staticPlugin<const Prefix extends string = '/prefix'>({
                             {
                                 'Cache-Control': maxAge
                                     ? `${directive}, max-age=${maxAge}`
-                                    : directive
+                                    : directive,
+                                'Accept-Ranges': 'bytes'
                             },
                             initialHeaders,
                             etag ? { Etag: etag } : {}
@@ -182,18 +240,41 @@ export async function staticPlugin<const Prefix extends string = '/prefix'>({
                     return response.clone()
                 }
 
+                async function handleWithoutETag({
+                    headers: requestHeaders
+                }: {
+                    headers: Record<string, string>
+                }) {
+                    // Check for range request first
+                    const rangeResponse = await handleRangeRequest(
+                        requestHeaders,
+                        file,
+                        fileSize
+                    )
+                    if (rangeResponse) return rangeResponse
+
+                    return new Response(
+                        file,
+                        isNotEmpty(initialHeaders)
+                            ? {
+                                headers: Object.assign(
+                                    {
+                                        'Accept-Ranges': 'bytes'
+                                    },
+                                    initialHeaders
+                                )
+                            }
+                            : {
+                                headers: {
+                                    'Accept-Ranges': 'bytes'
+                                }
+                            }
+                    )
+                }
+
                 app.get(
                     pathName,
-                    useETag
-                        ? (handleCache as any)
-                        : new Response(
-                              file,
-                              isNotEmpty(initialHeaders)
-                                  ? {
-                                        headers: initialHeaders
-                                    }
-                                  : undefined
-                          )
+                    useETag ? (handleCache as any) : (handleWithoutETag as any)
                 )
 
                 if (indexHTML && pathName.endsWith('/index.html'))
@@ -201,14 +282,7 @@ export async function staticPlugin<const Prefix extends string = '/prefix'>({
                         pathName.replace('/index.html', ''),
                         useETag
                             ? (handleCache as any)
-                            : new Response(
-                                  file,
-                                  isNotEmpty(initialHeaders)
-                                      ? {
-                                            headers: initialHeaders
-                                        }
-                                      : undefined
-                              )
+                            : (handleWithoutETag as any)
                     )
             }
 
@@ -239,7 +313,7 @@ export async function staticPlugin<const Prefix extends string = '/prefix'>({
             }
         }
 
-        app.onError(() => {}).get(
+        app.onError(() => { }).get(
             `${prefix}/*`,
             async ({ params, headers: requestHeaders }) => {
                 const pathName = path.join(
@@ -266,29 +340,82 @@ export async function staticPlugin<const Prefix extends string = '/prefix'>({
                         | NonNullable<Awaited<ReturnType<typeof getFile>>>
                         | undefined
 
-                    if (!isBun && indexHTML) {
+                    let actualPath = pathName
+                    let actualFileStat = fileStat
+
+                    if (!isBun && indexHTML && fileStat.isDirectory()) {
                         const htmlPath = path.join(pathName, 'index.html')
                         const cache = fileCache.get(htmlPath)
                         if (cache) return cache.clone()
 
-                        if (await fileExists(htmlPath))
+                        if (await fileExists(htmlPath)) {
+                            actualPath = htmlPath
+                            actualFileStat = await fs.stat(htmlPath)
                             file = await getFile(htmlPath)
+                        }
                     }
 
                     if (
                         !file &&
                         !fileStat.isDirectory() &&
                         (await fileExists(pathName))
-                    )
+                    ) {
                         file = await getFile(pathName)
-                    else throw new NotFoundError()
+                        actualPath = pathName
+                        actualFileStat = fileStat
+                    } else if (!file) {
+                        throw new NotFoundError()
+                    }
+
+                    // Check for range request
+                    const rangeHeader = requestHeaders['range']
+                    if (rangeHeader && actualFileStat) {
+                        const fileSize = actualFileStat.size
+                        const range = parseRange(rangeHeader, fileSize)
+
+                        if (range) {
+                            const rangeData = await getFileRange(actualPath, range)
+                            if (rangeData) {
+                                const etag = useETag ? await generateETag(file) : null
+
+                                return new Response(rangeData, {
+                                    status: 206,
+                                    headers: Object.assign(
+                                        {
+                                            'Content-Range': formatContentRange(range, fileSize),
+                                            'Cache-Control': maxAge
+                                                ? `${directive}, max-age=${maxAge}`
+                                                : directive,
+                                            'Accept-Ranges': 'bytes'
+                                        },
+                                        initialHeaders,
+                                        etag ? { Etag: etag } : {}
+                                    )
+                                })
+                            }
+                        }
+                    }
+
+                    const cache = fileCache.get(actualPath)
+                    if (cache) return cache.clone()
 
                     if (!useETag)
                         return new Response(
                             file,
                             isNotEmpty(initialHeaders)
-                                ? { headers: initialHeaders }
-                                : undefined
+                                ? {
+                                    headers: Object.assign(
+                                        {
+                                            'Accept-Ranges': 'bytes'
+                                        },
+                                        initialHeaders
+                                    )
+                                }
+                                : {
+                                    headers: {
+                                        'Accept-Ranges': 'bytes'
+                                    }
+                                }
                         )
 
                     const etag = await generateETag(file)
@@ -305,7 +432,8 @@ export async function staticPlugin<const Prefix extends string = '/prefix'>({
                             {
                                 'Cache-Control': maxAge
                                     ? `${directive}, max-age=${maxAge}`
-                                    : directive
+                                    : directive,
+                                'Accept-Ranges': 'bytes'
                             },
                             initialHeaders,
                             etag ? { Etag: etag } : {}

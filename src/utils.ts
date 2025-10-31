@@ -222,3 +222,100 @@ export const isNotEmpty = (obj?: Object) => {
 
     return false
 }
+
+export interface Range {
+    start: number
+    end: number
+}
+
+/**
+ * Parse Range header value
+ * Supports: bytes=start-end format
+ * Returns null if invalid or not a bytes range
+ */
+export function parseRange(
+    rangeHeader: string | undefined | null,
+    fileSize: number
+): Range | null {
+    if (!rangeHeader || !rangeHeader.startsWith('bytes=')) {
+        return null
+    }
+
+    const ranges = rangeHeader.slice(6).split(',')
+    // For simplicity, we only handle the first range
+    const range = ranges[0]?.trim()
+    if (!range) return null
+
+    const parts = range.split('-')
+    if (parts.length !== 2) return null
+
+    const startStr = parts[0]
+    const endStr = parts[1]
+
+    let start: number
+    let end: number
+
+    if (startStr === '') {
+        // Suffix range: -500 means last 500 bytes
+        const suffix = parseInt(endStr, 10)
+        if (isNaN(suffix) || suffix <= 0) return null
+        start = Math.max(0, fileSize - suffix)
+        end = fileSize - 1
+    } else if (endStr === '') {
+        // Prefix range: 500- means from byte 500 to end
+        start = parseInt(startStr, 10)
+        if (isNaN(start) || start < 0) return null
+        end = fileSize - 1
+    } else {
+        // Full range: 500-999
+        start = parseInt(startStr, 10)
+        end = parseInt(endStr, 10)
+        if (isNaN(start) || isNaN(end) || start < 0 || end < start) return null
+    }
+
+    // Clamp to file size
+    start = Math.max(0, Math.min(start, fileSize - 1))
+    end = Math.max(start, Math.min(end, fileSize - 1))
+
+    return { start, end }
+}
+
+/**
+ * Read a range of bytes from a file
+ */
+export async function getFileRange(
+    path: string,
+    range: Range
+): Promise<Buffer | null> {
+    if (isBun) {
+        const file = Bun.file(path)
+        const fileSize = file.size
+        if (range.start >= fileSize || range.end >= fileSize) return null
+
+        const arrayBuffer = await file.arrayBuffer()
+        return Buffer.from(arrayBuffer.slice(range.start, range.end + 1))
+    }
+
+    if (!fs) getBuiltinModule()
+
+    // For Node.js, we need to open the file and read a specific range
+    const fd = await fs.open(path, 'r').catch(() => null)
+    if (!fd) return null
+
+    try {
+        const length = range.end - range.start + 1
+        const buffer = Buffer.allocUnsafe(length)
+        const result = await fd.read(buffer, 0, length, range.start)
+        if (result.bytesRead === 0) return null
+        return buffer.subarray(0, result.bytesRead)
+    } finally {
+        await fd.close()
+    }
+}
+
+/**
+ * Format Content-Range header value
+ */
+export function formatContentRange(range: Range, fileSize: number): string {
+    return `bytes ${range.start}-${range.end}/${fileSize}`
+}
